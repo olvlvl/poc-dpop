@@ -1,0 +1,73 @@
+@startuml DPoP_Flow
+title DPoP Proof Generation and Challenge-Response Flow
+
+actor Client as C
+participant DPoPSigner as S <<Local Instance>>
+box "Authorization Server (AS)" #LightYellow
+    participant TokenEndpoint as AS_Token
+end box
+box "Resource Server (RS)" #LightBlue
+    participant ResourceEndpoint as RS_Res
+end box
+
+autonumber "T.0"
+== Token Acquisition (No 'ath' in Proof) ==
+
+C -> S: signProof(URL_TOKEN, POST, null)
+activate S
+S -> S: provideKey() (Get/Generate DPoPKey)
+S -> S: createDPoPProof() (Gen JWT, Sign, 'ath' claim missing)
+C -> AS_Token: POST /token (Authorization: DPoP <token>\nDPoP: <proof>)
+deactivate S
+
+AS_Token -> C: 200 OK (access_token, DPoP-Nonce: <nonce>)
+activate C
+C -> S: setOneShotNonce(<nonce>) // Proactive nonce for next request
+deactivate C
+
+autonumber 1
+== Protected Resource Access (Success/Proactive Nonce) ==
+
+C -> S: signProof(URL_RES, GET, <token>)
+activate S
+S -> S: retrieveKey()
+S -> S: retrieveOneShotNonce() // Consume stored nonce
+S -> S: createDPoPProof() (Gen JWT, Sign, 'ath' & 'nonce' present)
+C -> RS_Res: GET /resource (Authorization: DPoP <token>\nDPoP: <proof with nonce>)
+deactivate S
+
+RS_Res -> C: 200 OK
+activate C
+C -> S: setNonce(htu, nonce) // Store new nonce
+deactivate C
+
+autonumber resume
+== Protected Resource Access (Challenge/Retry) ==
+
+C -> S: signProof(URL_RES, GET, <token>)
+activate S
+S -> S: retrieveKey()
+S -> S: createDPoPProof() ('nonce' claim missing)
+C -> RS_Res: GET /resource (Authorization: DPoP <token>\nDPoP: <proof>)
+deactivate S
+
+RS_Res -> C: 401 Unauthorized (DPoP-Nonce: <new_nonce>)
+activate C
+
+note right
+    The DPoP fetch decorator handles the retry logic.
+end note
+
+C -> S: signProof(..., nonce=<new_nonce>) // RETRY
+activate S
+S -> S: retrieveKey()
+S -> S: createDPoPProof() ('nonce' claim present)
+C -> RS_Res: GET /resource (Authorization: DPoP <token>\nDPoP: <retry_proof>)
+deactivate S
+
+RS_Res -> C: 200 OK
+activate C
+C -> S: setNonce(htu, nonce) // Store new nonce
+deactivate C
+
+@enduml

@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "preserveConstEnums": true,
+    "target": "ESNext",
+    "lib": [
+      "DOM",
+      "ESNext"
+    ]
+  },
+  "files": [
+    "index.ts"
+  ],
+  "watchOptions": {
+    "watchFile": "useFsEvents",
+    "watchDirectory": "useFsEvents"
+  }
+}
