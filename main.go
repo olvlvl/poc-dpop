@@ -11,16 +11,47 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/fatih/color"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/lmittmann/tint"
 )
+
+var logger = slog.New(tint.NewHandler(os.Stdout, &tint.Options{
+	Level:      slog.LevelDebug,
+	TimeFormat: time.Kitchen,
+	ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if a.Key == slog.LevelKey {
+			level := a.Value.Any().(slog.Level)
+			levelLabel, levelColor := getLevel(level)
+			a.Value = slog.StringValue(levelColor.Sprint(levelLabel))
+		}
+		return a
+	},
+}))
+
+func getLevel(level slog.Level) (string, *color.Color) {
+	switch {
+	case level < slog.LevelDebug:
+		return "TRACE", color.New(color.FgMagenta)
+	case level < slog.LevelInfo:
+		return "DEBUG", color.New(color.FgGreen)
+	case level < slog.LevelWarn:
+		return "INFO", color.New(color.FgBlue)
+	case level < slog.LevelError:
+		return "WARN", color.New(color.FgYellow)
+	default:
+		return "ERROR", color.New(color.FgRed)
+	}
+}
 
 // Security Constants
 const (
@@ -30,12 +61,12 @@ const (
 	NonceLength       = 32
 )
 
-// NoncePolicy defines the nonce validation policy for DPoP validation
-type NoncePolicy bool
+// DPoPPolicy defines the nonce validation policy for DPoP validation
+type DPoPPolicy bool
 
 const (
-	NonceRequired          NoncePolicy = true  // Nonce must be present and valid
-	NonceValidateIfPresent NoncePolicy = false // Nonce is validated if present, but not required
+	NonceRequired          DPoPPolicy = true  // Nonce must be present and valid
+	NonceValidateIfPresent DPoPPolicy = false // Nonce is validated if present, but not required
 )
 
 const (
@@ -43,7 +74,10 @@ const (
 	DPoPErrorUseDPoPNonce = "use_dpop_nonce"
 )
 
-var ErrNonceRequired = errors.New("dpop nonce required or invalid")
+var (
+	ErrNonceRequired = errors.New("dpop nonce required")
+	ErrNonceInvalid  = errors.New("dpop nonce invalid")
+)
 
 // IsBehindTrustedProxy marks whether the server expects to be behind a trusted proxy.
 // When true, X-Forwarded-Proto headers are trusted for scheme detection.
@@ -322,107 +356,143 @@ type AccessTokenClaims struct {
 // DPoP Validation
 //
 
-// validateDPoPProof performs server-side DPoP validation
-func validateDPoPProof(r *http.Request, noncePolicy NoncePolicy) (string, error) {
+// validateDPoPProof is the main entry point for DPoP proof validation.
+// It orchestrates the parsing, cryptographic verification, and claim validation.
+func validateDPoPProof(r *http.Request, policy DPoPPolicy) (string, error) {
 	dpopHeader := r.Header.Get("DPoP")
 	if dpopHeader == "" {
 		return "", fmt.Errorf("DPoP header is missing")
 	}
 
-	parser := jwt.NewParser(jwt.WithJSONNumber(), jwt.WithLeeway(5*time.Second))
-	var jkt string
-
-	token, err := parser.ParseWithClaims(dpopHeader, &DPoPClaims{}, func(token *jwt.Token) (interface{}, error) {
-		// Get JWK from header
-		jwkInterface, ok := token.Header["jwk"]
-		if !ok {
-			return nil, fmt.Errorf("DPoP JWT header missing 'jwk'")
-		}
-		jwkMap, ok := jwkInterface.(map[string]interface{})
-		if !ok {
-			return nil, fmt.Errorf("DPoP JWT header 'jwk' is not a valid JSON object")
-		}
-
-		// Check 'typ' and 'alg'
-		if token.Header["typ"] != "dpop+jwt" {
-			return nil, fmt.Errorf("DPoP JWT 'typ' must be 'dpop+jwt'")
-		}
-		if token.Header["alg"] != "ES256" {
-			return nil, fmt.Errorf("DPoP JWT 'alg' must be 'ES256'")
-		}
-
-		// Validate JWK thumbprint (jkt) using RFC-7638 canonicalization
-		var err error
-		jkt, err = computeJWKThumbprint(jwkMap)
-		if err != nil {
-			return nil, fmt.Errorf("failed to compute jkt: %w", err)
-		}
-
-		// Parse public key for verification
-		return parseECPublicKeyFromJWK(jwkMap)
-	})
-
+	// 1. Parse and cryptographically verify the DPoP JWT
+	claims, jkt, err := parseAndVerifyDPoPJWT(dpopHeader)
 	if err != nil {
 		return "", fmt.Errorf("DPoP JWT validation failed: %w", err)
 	}
 
-	claims, ok := token.Claims.(*DPoPClaims)
-	if !ok || !token.Valid {
-		return "", fmt.Errorf("DPoP JWT is invalid")
+	// 2. Validate all claims against the request and policy
+	if err := validateDPoPClaims(claims, r, policy); err != nil {
+		return "", err // Return the specific claim validation error
 	}
 
+	return jkt, nil
+}
+
+// parseAndVerifyDPoPJWT handles the parsing and cryptographic verification of the DPoP JWT.
+// It returns the claims and the JWK thumbprint (jkt) if successful.
+func parseAndVerifyDPoPJWT(dpopHeader string) (*DPoPClaims, string, error) {
+	parser := jwt.NewParser(jwt.WithJSONNumber(), jwt.WithLeeway(5*time.Second))
+	var jkt string
+	claims := &DPoPClaims{}
+
+	token, err := parser.ParseWithClaims(dpopHeader, claims, func(token *jwt.Token) (interface{}, error) {
+		key, thumbprint, err := getDPoPVerificationKey(token)
+		if err != nil {
+			return nil, err
+		}
+		jkt = thumbprint
+		return key, nil
+	})
+
+	if err != nil {
+		return nil, "", err
+	}
+
+	if !token.Valid {
+		return nil, "", errors.New("DPoP JWT is invalid")
+	}
+
+	return claims, jkt, nil
+}
+
+// getDPoPVerificationKey extracts, validates, and returns the public key and thumbprint from the DPoP token header.
+func getDPoPVerificationKey(token *jwt.Token) (*ecdsa.PublicKey, string, error) {
+	// Validate 'typ' and 'alg' headers
+	if token.Header["typ"] != "dpop+jwt" {
+		return nil, "", fmt.Errorf("DPoP JWT 'typ' must be 'dpop+jwt'")
+	}
+	if token.Header["alg"] != "ES256" {
+		return nil, "", fmt.Errorf("DPoP JWT 'alg' must be 'ES256'")
+	}
+
+	// Get and validate JWK from header
+	jwkInterface, ok := token.Header["jwk"]
+	if !ok {
+		return nil, "", fmt.Errorf("DPoP JWT header missing 'jwk'")
+	}
+	jwkMap, ok := jwkInterface.(map[string]interface{})
+	if !ok {
+		return nil, "", fmt.Errorf("DPoP JWT header 'jwk' is not a valid JSON object")
+	}
+
+	// Compute JWK thumbprint (jkt)
+	jkt, err := computeJWKThumbprint(jwkMap)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to compute jkt: %w", err)
+	}
+
+	// Parse public key for signature verification
+	publicKey, err := parseECPublicKeyFromJWK(jwkMap)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to parse public key from jwk: %w", err)
+	}
+
+	return publicKey, jkt, nil
+}
+
+// validateDPoPClaims validates the DPoP claims against the HTTP request and security policy.
+func validateDPoPClaims(claims *DPoPClaims, r *http.Request, policy DPoPPolicy) error {
 	// Validate JTI
 	if claims.ID == "" {
-		return "", fmt.Errorf("DPoP JWT missing 'jti' claim")
+		return fmt.Errorf("DPoP JWT missing 'jti' claim")
 	}
-	// Calculate expiry for this JTI based on iat + DPoPMaxAge
 	if claims.IssuedAt == nil {
-		return "", fmt.Errorf("DPoP JWT missing 'iat' claim")
+		return fmt.Errorf("DPoP JWT missing 'iat' claim")
 	}
-
 	if jtiStore.IsUsed(claims.ID) {
-		return "", fmt.Errorf("DPoP JWT 'jti' has been used")
+		return fmt.Errorf("DPoP JWT 'jti' has been used")
 	}
-	// Mark as used with deterministic expiry
 	jtiStore.MarkUsed(claims.ID, claims.IssuedAt.Time.Add(DPoPMaxAge))
 
 	// Validate IAT
 	age := time.Since(claims.IssuedAt.Time)
 	if age > DPoPMaxAge {
-		return "", fmt.Errorf("DPoP JWT 'iat' is too old")
+		return fmt.Errorf("DPoP JWT 'iat' is too old")
 	}
 	if age < -time.Minute {
-		return "", fmt.Errorf("DPoP JWT 'iat' is in the future")
+		return fmt.Errorf("DPoP JWT 'iat' is in the future")
 	}
 
-	// Validate nonce if required
-	if noncePolicy == NonceRequired {
+	// Validate nonce
+	if policy == NonceRequired {
+		if claims.Nonce == "" {
+			return ErrNonceRequired
+		}
 		if !nonceStore.Validate(claims.Nonce) {
-			return "", ErrNonceRequired
+			return ErrNonceInvalid
 		}
 	} else if claims.Nonce != "" {
-		// validate if present
 		if !nonceStore.Validate(claims.Nonce) {
-			return "", ErrNonceRequired
+			return ErrNonceInvalid
 		}
 	}
 
-	// Validate HTM (case-insensitive)
+	// Validate HTM (HTTP Method)
 	if !strings.EqualFold(claims.Htm, r.Method) {
-		return "", fmt.Errorf("DPoP JWT 'htm' claim mismatch")
+		return fmt.Errorf("DPoP JWT 'htm' claim mismatch")
 	}
 
-	// Validate HTU
+	// Validate HTU (HTTP URI)
 	fullRequestURL := getFullURL(r)
 	normalizedURL, err := normalizeHtu(fullRequestURL)
 	if err != nil {
-		return "", fmt.Errorf("failed to normalize request URL: %w", err)
+		return fmt.Errorf("failed to normalize request URL: %w", err)
 	}
 	if claims.Htu != normalizedURL {
-		return "", fmt.Errorf("DPoP JWT 'htu' claim mismatch")
+		return fmt.Errorf("DPoP JWT 'htu' claim mismatch")
 	}
 
-	return jkt, nil
+	return nil
 }
 
 // normalizeHtu normalizes the HTTP URL for DPoP validation
@@ -462,7 +532,7 @@ func generateNonce() string {
 	nonceBytes := make([]byte, NonceLength)
 	_, err := rand.Read(nonceBytes)
 	if err != nil {
-		log.Printf("Failed to generate random nonce: %v", err)
+		logger.Error("Failed to generate random nonce", "error", err)
 		// Fallback (less secure)
 		return hashAndEncode([]byte(time.Now().String()))
 	}
@@ -471,7 +541,7 @@ func generateNonce() string {
 
 // dpopChallenge sends a DPoP challenge with a fresh nonce
 func dpopChallenge(w http.ResponseWriter, errorType string, reason string) {
-	log.Printf("DPoP Challenge issued: %s", reason)
+	logger.Warn("DPoP Challenge issued", "reason", reason)
 	newNonce := nonceStore.Issue()
 	// Include the nonce in the WWW-Authenticate header as per modern practice and RFC guidance
 	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`DPoP realm="dpop", error="%s", dpop_nonce="%s"`, errorType, newNonce))
@@ -571,7 +641,7 @@ func handleTokenRequest(w http.ResponseWriter, r *http.Request) {
 	// Validate DPoP proof (nonce not required for initial token request)
 	jkt, err := validateDPoPProof(r, NonceValidateIfPresent)
 	if err != nil {
-		log.Printf("DPoP validation failed: %v", err)
+		logger.Error("DPoP validation failed", "error", err)
 		dpopChallenge(w, DPoPErrorInvalidProof, "Invalid or missing DPoP proof")
 		return
 	}
@@ -591,7 +661,7 @@ func handleTokenRequest(w http.ResponseWriter, r *http.Request) {
 	// Generate access token bound to JKT
 	accessToken, err := generateAccessToken(jkt, "client-123")
 	if err != nil {
-		log.Printf("Token generation failed: %v", err)
+		logger.Error("Token generation failed", "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
@@ -628,7 +698,7 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 		if origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 		} else {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-control-Allow-Origin", "*")
 		}
 
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
@@ -650,7 +720,7 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 // 2. The access token is valid and contains a JKT binding
 // 3. The DPoP proof is valid and includes the required nonce
 // 4. The JKT from the proof matches the JKT bound to the access token
-func dpopValidator(next http.HandlerFunc, noncePolicy NoncePolicy) http.HandlerFunc {
+func dpopValidator(next http.HandlerFunc, policy DPoPPolicy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		dpopProof := r.Header.Get("DPoP")
@@ -670,22 +740,25 @@ func dpopValidator(next http.HandlerFunc, noncePolicy NoncePolicy) http.HandlerF
 		// Validate access token and extract expected JKT
 		expectedJkt, err := extractJktFromAccessToken(authHeader)
 		if err != nil {
-			log.Printf("Access token validation failed: %v", err)
+			logger.Error("Access token validation failed", "error", err)
 			http.Error(w, "Invalid access token", http.StatusUnauthorized)
 			return
 		}
 
 		// Validate DPoP proof (nonce may be required)
-		proofJkt, err := validateDPoPProof(r, noncePolicy)
+		proofJkt, err := validateDPoPProof(r, policy)
 		if err != nil {
-			log.Printf("DPoP proof validation failed: %v", err)
+			logger.Error("DPoP proof validation failed", "error", err)
 
 			errorType := DPoPErrorInvalidProof
 			reason := "Invalid DPoP proof"
 
 			if errors.Is(err, ErrNonceRequired) {
 				errorType = DPoPErrorUseDPoPNonce
-				reason = "Missing or expired DPoP nonce"
+				reason = "DPoP nonce is missing"
+			} else if errors.Is(err, ErrNonceInvalid) {
+				errorType = DPoPErrorUseDPoPNonce
+				reason = "DPoP nonce is invalid or has expired"
 			}
 
 			dpopChallenge(w, errorType, reason)
@@ -695,13 +768,14 @@ func dpopValidator(next http.HandlerFunc, noncePolicy NoncePolicy) http.HandlerF
 		// Enforce token binding - the proof must be from the same key as the token
 		// Use constant-time comparison to avoid timing leakage
 		if subtle.ConstantTimeCompare([]byte(proofJkt), []byte(expectedJkt)) != 1 {
-			log.Printf("Token binding validation failed")
+			logger.Error("Token binding mismatch", "expected", expectedJkt, "actual", proofJkt)
 			http.Error(w, "Token binding mismatch", http.StatusForbidden)
 			return
 		}
 
 		// We issue fresh nonce on successful validation, so the next request is not challenged.
 		w.Header().Set("DPoP-Nonce", nonceStore.Issue())
+		logger.Info("DPoP proof validated successfully, issuing fresh nonce")
 
 		next.ServeHTTP(w, r)
 	}
@@ -715,14 +789,15 @@ func dpopValidator(next http.HandlerFunc, noncePolicy NoncePolicy) http.HandlerF
 // In production, keys should be loaded from secure storage (KMS, files, etc.)
 // and rotated periodically.
 func initKeys() {
-	log.Println("Generating RSA 2048-bit key pair...")
+	logger.Info("Generating RSA 2048-bit key pair...")
 	var err error
 	RSAPrivateKey, err = rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		log.Fatalf("Failed to generate RSA private key: %v", err)
+		logger.Error("Failed to generate RSA private key", "error", err)
+		os.Exit(1)
 	}
 	RSAPublicKey = &RSAPrivateKey.PublicKey
-	log.Println("RSA key pair generated successfully.")
+	logger.Info("RSA key pair generated successfully.")
 }
 
 // initConfig loads configuration from environment variables.
@@ -733,7 +808,7 @@ func initConfig() {
 	//     IsBehindTrustedProxy = true
 	// }
 
-	log.Printf("Configuration: IsBehindTrustedProxy=%v", IsBehindTrustedProxy)
+	logger.Info("Configuration", "IsBehindTrustedProxy", IsBehindTrustedProxy)
 }
 
 // startCleanupRoutines starts background cleanup goroutines
@@ -752,7 +827,7 @@ func startCleanupRoutines() {
 //
 
 func main() {
-	log.Println("=== DPoP Server Initialization ===")
+	logger.Info("=== DPoP Server Initialization ===")
 
 	// Load configuration
 	initConfig()
@@ -760,14 +835,14 @@ func main() {
 	// Initialize stores
 	jtiStore = NewJTIStore()
 	nonceStore = NewNonceStore()
-	log.Println("JTI and Nonce stores initialized")
+	logger.Info("JTI and Nonce stores initialized")
 
 	// Initialize cryptographic keys
 	initKeys()
 
 	// Start cleanup routines
 	startCleanupRoutines()
-	log.Println("Background cleanup routines started")
+	logger.Info("Background cleanup routines started")
 
 	// Define endpoints
 	http.HandleFunc("/token", enableCORS(handleTokenRequest))
@@ -776,18 +851,19 @@ func main() {
 	http.HandleFunc("/challenge", enableCORS(dpopValidator(handleResourceRequest, NonceRequired)))
 
 	port := ":8080"
-	log.Println("=== Server Configuration ===")
-	log.Printf("Listening on: %s", port)
-	log.Printf("Token endpoint: http://localhost%s/token", port)
-	log.Printf("High value endpoint: http://localhost%s/high-value-resource", port)
-	log.Printf("Low value endpoint: http://localhost%s/low-value-resource", port)
-	log.Println("=================================")
-	log.Println("⚠️  WARNING: Using HTTP for local testing only!")
-	log.Println("⚠️  PRODUCTION DEPLOYMENT REQUIRES HTTPS!")
-	log.Println("=================================")
+	logger.Info("=== Server Configuration ===")
+	logger.Info("Listening on", "port", port)
+	logger.Info("Token endpoint", "url", fmt.Sprintf("http://localhost%s/token", port))
+	logger.Info("High value endpoint", "url", fmt.Sprintf("http://localhost%s/high-value-resource", port))
+	logger.Info("Low value endpoint", "url", fmt.Sprintf("http://localhost%s/low-value-resource", port))
+	logger.Info("=================================")
+	logger.Warn("⚠️  WARNING: Using HTTP for local testing only!")
+	logger.Warn("⚠️  PRODUCTION DEPLOYMENT REQUIRES HTTPS!")
+	logger.Info("=================================")
 
 	// Start server
 	if err := http.ListenAndServe(port, nil); err != nil {
-		log.Fatal(err)
+		logger.Error("Server failed to start", "error", err)
+		os.Exit(1)
 	}
 }
