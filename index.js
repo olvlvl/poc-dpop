@@ -468,29 +468,6 @@ class DPoPUrlNormalizer {
 }
 class DPoPSigner {
     provider;
-    /**
-     * Stores the next expected DPoP nonce, keyed by the normalized HTTP URL (htu).
-     *
-     * This cache is critical for two purposes:
-     *
-     * 1. Proactive Use: It stores a new nonce received on a successful 200 OK
-     * response (from either the token or resource endpoint) for the *next* request
-     * to the same resource, preventing a mandatory 401 challenge.
-     *
-     * 2. Challenge-Response Staging: It acts as the temporary staging area for a nonce
-     * received during a 401 Unauthorized challenge. When a challenge occurs,
-     * the decorator stores the new nonce here, allowing the signProof method to
-     * reliably pull it for the immediate retry attempt.
-     *
-     * Note: Nonces are single-use, so entries are invalidated on successful consumption.
-     * The htu key ensures correct nonce isolation across different API endpoints.
-     */
-    nonceCache = new Map();
-    /**
-     * Stores a one-shot global nonce for the *very next* request only.
-     * Not keyed by HTU. Used for challenge-response and post-token optimization.
-     */
-    oneShotNonce = null;
     constructor(provider = new DPoPKeyProvider()) {
         this.provider = provider;
     }
@@ -503,46 +480,9 @@ class DPoPSigner {
      */
     async signProof(input, method, options = {}) {
         const htu = DPoPUrlNormalizer.normalizeRequestInput(input);
-        // Consume the stored nonce atomically so parallel calls cannot both use it.
-        let nonce = options.nonce;
-        if (!nonce) {
-            const stored = this.oneShotNonce;
-            if (stored !== null) {
-                // Only the thread that sees non-null consumes it.
-                nonce = stored;
-                this.oneShotNonce = null;
-            }
-        }
-        // Atomically claim nonce synchronously before any await.
-        if (!nonce) {
-            nonce = this.nonceCache.get(htu);
-            this.nonceCache.delete(htu);
-        }
-        // To avoid race conditions, it's IMPORTANT for `await` to be AFTER the nonce claim.
+        const nonce = options.nonce;
         const dpopKey = await this.provider.provideKey();
         return createDPoPJwt(dpopKey, method, htu, options.accessToken || null, nonce || null);
-    }
-    /**
-     * Stores a nonce received from the server for a specific endpoint.
-     * @param {string} endpoint The endpoint URL
-     * @param {string} nonce The nonce value
-     */
-    setNonce(endpoint, nonce) {
-        this.nonceCache.set(endpoint, nonce);
-    }
-    /**
-     * Sets the one-shot global nonce for the next request that doesn't define one.
-     * @param {string} nonce The nonce value
-     */
-    setOneShotNonce(nonce) {
-        this.oneShotNonce = nonce;
-    }
-    /**
-     * Clears the nonce for a specific endpoint.
-     * @param {string} endpoint The endpoint URL
-     */
-    clearNonce(endpoint) {
-        this.nonceCache.delete(endpoint);
     }
     /**
      * Rotates the DPoP key if needed based on age.
@@ -565,14 +505,40 @@ class DPoPSigner {
  * @param {Function} getAccessToken A function that returns the access token to use for requests.
  */
 function createDPoPFetch(fetch, signer, getAccessToken) {
+    /**
+     * A generic pool of nonces received from the server on successful responses.
+     * These are used proactively for new requests to avoid an initial 401 challenge.
+     */
+    const noncePool = [];
+    /**
+     * Adds a nonce received from the server to the proactive pool.
+     */
+    function addNonceToPool(nonce) {
+        if (nonce) {
+            console.log('Add Nonce', nonce);
+            noncePool.push(nonce);
+        }
+    }
+    /**
+     * Retrieves and removes a single nonce from the pool.
+     */
+    function getNonceFromPool() {
+        const nonce = noncePool.pop() || null;
+        console.log('Use Nonce', nonce);
+        return nonce;
+    }
     return async (input, init) => {
         console.debug("fetching: ", input, " with init:", init);
         try {
             const method = init?.method || 'GET';
             const headers = new Headers(init?.headers || {});
             const accessToken = getAccessToken();
-            // Generate DPoP proof
-            const dpopProof = await signer.signProof(input, method, { accessToken });
+            // Generate DPoP proof for the first attempt. This may use a pooled nonce.
+            const nonceForFirstAttempt = getNonceFromPool();
+            const dpopProof = await signer.signProof(input, method, {
+                accessToken,
+                nonce: nonceForFirstAttempt
+            });
             // Add Authorization header if access token is provided
             if (accessToken) {
                 // DPoP tokens MUST use the DPoP type
@@ -588,26 +554,27 @@ function createDPoPFetch(fetch, signer, getAccessToken) {
             let nonce = extractDPoPNonce(response.headers);
             // Handle DPoP nonce requirement (status 401)
             if (response.status === 401 && nonce) {
-                // Retry the request with the nonce
+                console.log('Retrying 401 request with DPoP-Nonce...');
+                // This is the "reactive" flow. The nonce from the challenge is used
+                // directly and is not added to the pool.
                 const retryProof = await signer.signProof(input, method, {
                     accessToken,
                     nonce // Explicitly pass the new nonce for the retry proof
                 });
                 headers.set('DPoP', retryProof);
-                console.log('Retrying 401 request with DPoP-Nonce...');
                 // Retry attempt
                 response = await fetch(input, {
                     ...init,
                     method: method,
                     headers: headers,
                 });
+                // After the retry, the server may provide yet another nonce for the next request.
                 nonce = extractDPoPNonce(response.headers);
             }
-            // Store nonce on a successful request so that it can be used
-            // for the next request to the same endpoint.
+            // This is the "proactive" flow. On any successful request, if the server
+            // provides a nonce, add it to the pool for a future request to use.
             if (response.ok && nonce) {
-                const htu = DPoPUrlNormalizer.normalizeRequestInput(input);
-                signer.setNonce(htu, nonce);
+                addNonceToPool(nonce);
             }
             return response;
         }
@@ -645,7 +612,6 @@ class DPoPToken {
     const URL_TOKEN = "http://localhost:8080/token";
     const URL_HIGH_VALUE_RESOURCE = "http://localhost:8080/high-value-resource";
     const URL_LOW_VALUE_RESOURCE = "http://localhost:8080/low-value-resource";
-    const URL_CHALLENGE = "http://localhost:8080/challenge";
     const signer = new DPoPSigner();
     await signer.rotateKeyIfNeeded();
     let accessToken = null;
@@ -665,11 +631,19 @@ class DPoPToken {
             return;
         }
         accessToken = await DPoPToken.fromTokenResponse(tokenResponse, tokenRequestTime);
-        const nonce = extractDPoPNonce(tokenResponse.headers);
         console.log('Access Token:', accessToken);
-        console.log('Nonce:', nonce);
-        // Use the nonce provided with the token response to skip the challenge of the next request.
-        signer.setOneShotNonce(nonce);
+        // Concurrent requests are competing for the token's nonce.
+        await Promise.all([
+            // High Value Resource
+            dpopFetch(URL_HIGH_VALUE_RESOURCE),
+            dpopFetch(URL_HIGH_VALUE_RESOURCE),
+            dpopFetch(URL_HIGH_VALUE_RESOURCE),
+            // Low Value Resource
+            dpopFetch(URL_LOW_VALUE_RESOURCE),
+            dpopFetch(URL_LOW_VALUE_RESOURCE),
+            dpopFetch(URL_LOW_VALUE_RESOURCE),
+        ]);
+        // Sequential requests can reuse previous nonces.
         // High Value Resource
         await dpopFetch(URL_HIGH_VALUE_RESOURCE);
         await dpopFetch(URL_HIGH_VALUE_RESOURCE);
@@ -678,9 +652,6 @@ class DPoPToken {
         await dpopFetch(URL_LOW_VALUE_RESOURCE);
         await dpopFetch(URL_LOW_VALUE_RESOURCE);
         await dpopFetch(URL_LOW_VALUE_RESOURCE);
-        // Challenge Resource
-        await dpopFetch(URL_CHALLENGE); // Should be issued a DPoP-Nonce challenge
-        await dpopFetch(URL_CHALLENGE); // Should reuse the DPoP-Nonce from the previous request
     }
     catch (error) {
         console.error('Request failed:', error);

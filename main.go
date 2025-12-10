@@ -716,36 +716,37 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 
 // dpopValidator enforces DPoP proof-of-possession for protected resources.
 // This middleware validates that:
-// 1. Both Authorization and DPoP headers are present
-// 2. The access token is valid and contains a JKT binding
-// 3. The DPoP proof is valid and includes the required nonce
-// 4. The JKT from the proof matches the JKT bound to the access token
+// 1. The Authorization header is present.
+// 2. The access token is valid and contains a JKT binding.
+// 3. The DPoP proof header is present and the proof is valid (including nonce).
+// 4. The JKT from the proof matches the JKT bound to the access token.
 func dpopValidator(next http.HandlerFunc, policy DPoPPolicy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// 1. Validate Authorization header and extract the token's expected JKT
 		authHeader := r.Header.Get("Authorization")
-		dpopProof := r.Header.Get("DPoP")
-
-		if authHeader == "" || dpopProof == "" {
-			// Issue challenge to guide the client on what's needed
-			reason := "Missing DPoP authentication"
-			if authHeader == "" {
-				reason = "Missing Authorization header"
-			} else if dpopProof == "" {
-				reason = "Missing DPoP proof header"
-			}
-			dpopChallenge(w, DPoPErrorInvalidProof, reason)
+		if authHeader == "" {
+			// Use a generic challenge; we don't know yet if DPoP is required.
+			http.Error(w, "Missing Authorization header", http.StatusUnauthorized)
 			return
 		}
 
-		// Validate access token and extract expected JKT
 		expectedJkt, err := extractJktFromAccessToken(authHeader)
 		if err != nil {
+			// This error means the token is invalid, expired, or not a DPoP token.
 			logger.Error("Access token validation failed", "error", err)
 			http.Error(w, "Invalid access token", http.StatusUnauthorized)
 			return
 		}
 
-		// Validate DPoP proof (nonce may be required)
+		// 2. Since the token is a DPoP token (it has a JKT), we MUST have a DPoP proof.
+		dpopProof := r.Header.Get("DPoP")
+		if dpopProof == "" {
+			// Now we know a DPoP proof was required. Challenge the client.
+			dpopChallenge(w, DPoPErrorInvalidProof, "DPoP proof is required but was not provided")
+			return
+		}
+
+		// 3. Validate the DPoP proof itself.
 		proofJkt, err := validateDPoPProof(r, policy)
 		if err != nil {
 			logger.Error("DPoP proof validation failed", "error", err)
@@ -765,15 +766,15 @@ func dpopValidator(next http.HandlerFunc, policy DPoPPolicy) http.HandlerFunc {
 			return
 		}
 
-		// Enforce token binding - the proof must be from the same key as the token
-		// Use constant-time comparison to avoid timing leakage
+		// 4. Enforce token binding: the JKT from the proof must match the JKT in the token.
+		// Use constant-time comparison to avoid timing leakage.
 		if subtle.ConstantTimeCompare([]byte(proofJkt), []byte(expectedJkt)) != 1 {
 			logger.Error("Token binding mismatch", "expected", expectedJkt, "actual", proofJkt)
 			http.Error(w, "Token binding mismatch", http.StatusForbidden)
 			return
 		}
 
-		// We issue fresh nonce on successful validation, so the next request is not challenged.
+		// We issue a fresh nonce on successful validation, so the next request is not challenged.
 		w.Header().Set("DPoP-Nonce", nonceStore.Issue())
 		logger.Info("DPoP proof validated successfully, issuing fresh nonce")
 
@@ -848,7 +849,6 @@ func main() {
 	http.HandleFunc("/token", enableCORS(handleTokenRequest))
 	http.HandleFunc("/high-value-resource", enableCORS(dpopValidator(handleResourceRequest, NonceRequired)))
 	http.HandleFunc("/low-value-resource", enableCORS(dpopValidator(handleResourceRequest, NonceValidateIfPresent)))
-	http.HandleFunc("/challenge", enableCORS(dpopValidator(handleResourceRequest, NonceRequired)))
 
 	port := ":8080"
 	logger.Info("=== Server Configuration ===")
