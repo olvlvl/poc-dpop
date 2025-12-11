@@ -126,10 +126,10 @@ async function createDPoPJwt(
         ath?: string;
         nonce?: string;
     } = {
-        'jti': globalThis.crypto.randomUUID(),    // Unique JWT ID to prevent replay attacks
-        'htm': htm.toUpperCase(),                 // HTTP Method (normalized to uppercase)
+        'jti': globalThis.crypto.randomUUID(),        // Unique JWT ID to prevent replay attacks
+        'htm': htm.toUpperCase(),                     // HTTP Method (normalized to uppercase)
         'htu': DPoPUrlNormalizer.normalizeUrl(htu),   // Normalized HTTP URL
-        'iat': Math.floor(Date.now() / 1000),     // Issued At timestamp
+        'iat': Math.floor(Date.now() / 1000),         // Issued At timestamp
     }
 
     // Include 'ath' (Access Token Hash) if an access token is provided
@@ -375,7 +375,7 @@ class DPoPKeyProvider {
 
         // 3. Export the public key as a JWK (JSON Web Key)
         const exportedKey = await globalThis.crypto.subtle.exportKey('jwk', keyPair.publicKey)
-        const dpopJwk = this.canonicalizeEcPublicJwk(exportedKey as JsonWebKey)
+        const dpopJwk = this.canonicalizeEcPublicJwk(exportedKey)
 
         // 4. Calculate the 'jkt' (JSON Web Key Thumbprint)
         // Per RFC 7638, the JWK must be cleaned of private claims, and keys must be
@@ -637,6 +637,60 @@ class DPoPSigner {
     }
 }
 
+/**
+ * Stores the necessary components required for authenticating requests to protected resources.
+ */
+class DPoPToken {
+    private constructor(
+        public readonly accessToken: string,
+        public readonly expiresIn: number,
+        public readonly type: string,
+        public readonly expiresAt: number
+    ) {
+    }
+
+    public static async fromTokenResponse(response: Response, requestTime: number): Promise<DPoPToken> {
+        const json = await response.json()
+
+        if (!json.access_token) {
+            throw "Expected access_token in response"
+        }
+
+        return new DPoPToken(
+            json.access_token,
+            json.expires_in,
+            json.token_type,
+            requestTime + json.expires_in * 1000
+        )
+    }
+}
+
+/**
+ * A pool of nonces received from the server on successful responses.
+ * These are used proactively for new requests to avoid an initial 401 challenge.
+ */
+class DPoPNoncePool {
+    private readonly pool: string[] = [];
+
+    /**
+     * Puts an nonce into the pool.
+     *
+     * @param {String} nonce
+     */
+    put(nonce: string): void {
+        this.pool.push(nonce);
+    }
+
+    /**
+     * Takes an nonce from the pool.
+     *
+     * @returns {String | null}
+     */
+    take(): string | null {
+        return this.pool.shift() || null;
+    }
+}
+
 //
 // DPoP `fetch` decorator.
 //
@@ -645,38 +699,15 @@ class DPoPSigner {
  * Decorates the `fetch` function to add DPoP support.
  * @param {Function} fetch The fetch function to decorate.
  * @param {DPoPSigner} signer The DPoP proof signer.
+ * @param {DPoPNoncePool} noncePool An optional nonce pool to use for proactive nonce handling.
  * @param {Function} getAccessToken A function that returns the access token to use for requests.
  */
 function createDPoPFetch(
     fetch: (input: RequestInfo | URL, init?: RequestInit | null) => Promise<Response>,
     signer: DPoPSigner,
+    noncePool: DPoPNoncePool | null,
     getAccessToken: () => string | null,
 ) {
-    /**
-     * A generic pool of nonces received from the server on successful responses.
-     * These are used proactively for new requests to avoid an initial 401 challenge.
-     */
-    const noncePool: string[] = [];
-
-    /**
-     * Adds a nonce received from the server to the proactive pool.
-     */
-    function addNonceToPool(nonce: string): void {
-        if (nonce) {
-            console.log('Add Nonce', nonce)
-            noncePool.push(nonce);
-        }
-    }
-
-    /**
-     * Retrieves and removes a single nonce from the pool.
-     */
-    function getNonceFromPool(): string | null {
-        const nonce = noncePool.pop() || null;
-        console.log('Use Nonce', nonce)
-        return nonce;
-    }
-
     return async (
         input: RequestInfo | URL,
         init?: RequestInit | null
@@ -689,7 +720,7 @@ function createDPoPFetch(
             const accessToken = getAccessToken()
 
             // Generate DPoP proof for the first attempt. This may use a pooled nonce.
-            const nonceForFirstAttempt = getNonceFromPool();
+            const nonceForFirstAttempt = noncePool?.take();
             const dpopProof = await signer.signProof(input, method, {
                 accessToken,
                 nonce: nonceForFirstAttempt
@@ -739,7 +770,7 @@ function createDPoPFetch(
             // This is the "proactive" flow. On any successful request, if the server
             // provides a nonce, add it to the pool for a future request to use.
             if (response.ok && nonce) {
-                addNonceToPool(nonce)
+                noncePool?.put(nonce)
             }
 
             return response
@@ -750,53 +781,28 @@ function createDPoPFetch(
     }
 }
 
-/**
- * Stores the necessary components required for authenticating requests to protected resources.
- */
-class DPoPToken {
-    private constructor(
-        public readonly accessToken: string,
-        public readonly expiresIn: number,
-        public readonly type:string,
-        public readonly expiresAt: number
-    ) {
-    }
-
-    public static async fromTokenResponse(response: Response, requestTime: number): Promise<DPoPToken> {
-        const json = await response.json()
-
-        if (!json.access_token) {
-            throw "Expected access_token in response"
-        }
-
-        return new DPoPToken(
-            json.access_token,
-            json.expires_in,
-            json.token_type,
-            requestTime + json.expires_in * 1000
-        )
-    }
-}
-
 // Example usage
 (async function () {
     'use strict'
 
     const URL_TOKEN = "http://localhost:8080/token"
-    const URL_HIGH_VALUE_RESOURCE = "http://localhost:8080/high-value-resource"
-    const URL_LOW_VALUE_RESOURCE = "http://localhost:8080/low-value-resource"
+    const URL_HIGH_VALUE_RESOURCE = "http://localhost:8080/high-value-resource" // this require nonce
+    const URL_LOW_VALUE_RESOURCE = "http://localhost:8080/low-value-resource"   // this does not require nonce
 
     const signer = new DPoPSigner()
     await signer.rotateKeyIfNeeded()
     let accessToken: DPoPToken | null = null
+    const noncePool = new DPoPNoncePool()
+    const accessTokenProvider = (): string | null => accessToken?.accessToken
 
-    const dpopFetch = createDPoPFetch(fetch, signer, (): string | null => accessToken?.accessToken)
+    const dpopFetch = createDPoPFetch(fetch, signer, null, accessTokenProvider)
+    const dpopFetchWithNonce = createDPoPFetch(fetch, signer, noncePool, accessTokenProvider)
 
     try {
         console.log('Getting token…')
 
         const tokenRequestTime = Date.now();
-        const tokenResponse = await dpopFetch(URL_TOKEN, {
+        const tokenResponse = await dpopFetchWithNonce(URL_TOKEN, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
@@ -813,32 +819,34 @@ class DPoPToken {
 
         console.log('Access Token:', accessToken)
 
-        // Concurrent requests are competing for the token's nonce.
+        // Concurrent requests compete for the token's nonce.
+        // Low Value Resource should pass unchallenged
         await Promise.all([
-
-            // High Value Resource
-            dpopFetch(URL_HIGH_VALUE_RESOURCE),
-            dpopFetch(URL_HIGH_VALUE_RESOURCE),
-            dpopFetch(URL_HIGH_VALUE_RESOURCE),
-
-            // Low Value Resource
             dpopFetch(URL_LOW_VALUE_RESOURCE),
             dpopFetch(URL_LOW_VALUE_RESOURCE),
             dpopFetch(URL_LOW_VALUE_RESOURCE),
-
         ])
 
-        // Sequential requests can reuse previous nonces.
-
-        // High Value Resource
-        await dpopFetch(URL_HIGH_VALUE_RESOURCE)
-        await dpopFetch(URL_HIGH_VALUE_RESOURCE)
-        await dpopFetch(URL_HIGH_VALUE_RESOURCE)
+        // High Value Resource requires a DPoP nonce and should be challenged
+        // One of these reuses the nonce from the token request
+        await Promise.all([
+            // High Value Resource
+            dpopFetchWithNonce(URL_HIGH_VALUE_RESOURCE),
+            dpopFetchWithNonce(URL_HIGH_VALUE_RESOURCE),
+            dpopFetchWithNonce(URL_HIGH_VALUE_RESOURCE),
+        ])
 
         // Low Value Resource
         await dpopFetch(URL_LOW_VALUE_RESOURCE)
         await dpopFetch(URL_LOW_VALUE_RESOURCE)
         await dpopFetch(URL_LOW_VALUE_RESOURCE)
+
+        // High Value Resource reusing nonce
+        await Promise.all([
+            dpopFetchWithNonce(URL_HIGH_VALUE_RESOURCE),
+            dpopFetchWithNonce(URL_HIGH_VALUE_RESOURCE),
+            dpopFetchWithNonce(URL_HIGH_VALUE_RESOURCE),
+        ])
 
     } catch (error) {
         console.error('Request failed:', error)

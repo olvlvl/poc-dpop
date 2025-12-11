@@ -1,0 +1,22 @@
+@startuml
+skinparam style strict
+
+actor Client
+participant "Authorization Server" as AS
+participant "Resource Server" as RS
+
+== Token Issuance ==
+
+Client -> AS: (A) Token Request\n(DPoP Proof)
+note right of AS: The AS verifies the DPoP Proof\nand binds the token to the client's key.
+
+AS --> Client: (B) DPoP-Bound Access Token\n(token_type=DPoP)
+
+== Resource Access ==
+
+Client -> RS: (C) DPoP-Bound Access Token\n(DPoP Proof)
+note right of RS: The RS verifies the token signature\nand the DPoP Proof against the token's key.
+
+RS --> Client: (D) Protected Resource
+
+@enduml

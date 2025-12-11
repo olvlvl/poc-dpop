@@ -1,73 +1,99 @@
-@startuml DPoP_Flow
-title DPoP Proof Generation and Challenge-Response Flow
+@startuml
+title DPoP Authorization and Resource Access Flow
 
 actor Client as C
-participant DPoPSigner as S <<Local Instance>>
-box "Authorization Server (AS)" #LightYellow
-    participant TokenEndpoint as AS_Token
-end box
-box "Resource Server (RS)" #LightBlue
-    participant ResourceEndpoint as RS_Res
-end box
+participant "Authorization Server (AS)" as AS
+participant "Resource Server (RS)" as RS
 
-autonumber "T.0"
-== Token Acquisition (No 'ath' in Proof) ==
+group Token Issuance
+    C -> C: Generate DPoP Key Pair (if none exists)
+    note right: Manages key in IndexedDB
 
-C -> S: signProof(URL_TOKEN, POST, null)
-activate S
-S -> S: provideKey() (Get/Generate DPoPKey)
-S -> S: createDPoPProof() (Gen JWT, Sign, 'ath' claim missing)
-C -> AS_Token: POST /token (Authorization: DPoP <token>\nDPoP: <proof>)
-deactivate S
+    C -> AS: POST /token\n(with DPoP Proof)
+    note left
+      **DPoP Proof includes:**
+      - Public Key (jwk)
+      - htm: "POST"
+      - htu: ".../token"
+    end note
 
-AS_Token -> C: 200 OK (access_token, DPoP-Nonce: <nonce>)
-activate C
-C -> S: setOneShotNonce(<nonce>) // Proactive nonce for next request
-deactivate C
+    AS -> AS: Validate DPoP Proof
+    note right
+     - Verify signature with jwk
+     - Check htm, htu, iat, jti
+    end note
 
-autonumber 1
-== Protected Resource Access (Success/Proactive Nonce) ==
+    AS -> AS: Generate DPoP Access Token
+    note right
+     - Create JWT with claims
+     - Add 'cnf' claim with 'jkt'
+       (thumbprint of client's public key)
+    end note
 
-C -> S: signProof(URL_RES, GET, <token>)
-activate S
-S -> S: retrieveKey()
-S -> S: retrieveOneShotNonce() // Consume stored nonce
-S -> S: createDPoPProof() (Gen JWT, Sign, 'ath' & 'nonce' present)
-C -> RS_Res: GET /resource (Authorization: DPoP <token>\nDPoP: <proof with nonce>)
-deactivate S
+    AS -> C: 200 OK\n(Access Token + DPoP-Nonce)
+    note left
+      **Response includes:**
+      - token_type: "DPoP"
+      - access_token: (JWT with jkt)
+      - DPoP-Nonce header for next request
+    end note
 
-RS_Res -> C: 200 OK
-activate C
-C -> S: setNonce(htu, nonce) // Store new nonce
-deactivate C
+    C -> C: Store Access Token & Add Nonce to Pool
+end
 
-autonumber resume
-== Protected Resource Access (Challenge/Retry) ==
+group Resource Access (Happy Path - with proactive nonce)
+    C -> C: Get Nonce from Pool
+    C -> RS: GET /resource\n(Authorization + DPoP Proof)
+    note left
+      **Headers include:**
+      - Authorization: DPoP <access_token>
+      - DPoP: (new proof)
 
-C -> S: signProof(URL_RES, GET, <token>)
-activate S
-S -> S: retrieveKey()
-S -> S: createDPoPProof() ('nonce' claim missing)
-C -> RS_Res: GET /resource (Authorization: DPoP <token>\nDPoP: <proof>)
-deactivate S
+      **DPoP Proof includes:**
+      - jwk, htm, htu
+      - ath: hash(access_token)
+      - nonce: (from pool)
+    end note
 
-RS_Res -> C: 401 Unauthorized (DPoP-Nonce: <new_nonce>)
-activate C
+    RS -> RS: Validate Access Token & DPoP Proof
+    note right
+      1. Validate Access Token signature
+      2. Extract 'jkt' from Access Token
+      3. Validate DPoP Proof (signature, htm, htu, ath)
+      4. Validate nonce from proof
+      5. **Token Binding:** Compare 'jkt' from token
+         with 'jkt' computed from proof's jwk.
+    end note
 
-note right
-    The DPoP fetch decorator handles the retry logic.
-end note
+    RS -> C: 200 OK (Resource Data + DPoP-Nonce)
+    note left: Server provides a new nonce for the next request.
 
-C -> S: signProof(..., nonce=<new_nonce>) // RETRY
-activate S
-S -> S: retrieveKey()
-S -> S: createDPoPProof() ('nonce' claim present)
-C -> RS_Res: GET /resource (Authorization: DPoP <token>\nDPoP: <retry_proof>)
-deactivate S
+    C -> C: Add new Nonce to Pool
+end
 
-RS_Res -> C: 200 OK
-activate C
-C -> S: setNonce(htu, nonce) // Store new nonce
-deactivate C
+group Resource Access (Challenge-Response Path)
+    C -> RS: GET /resource\n(Authorization + DPoP Proof w/o nonce)
+    note left: Client has no nonce in its pool.
+
+    RS -> RS: Validate DPoP Proof
+    note right: Validation fails: Nonce is required but missing.
+
+    RS -> C: 401 Unauthorized\n(with DPoP-Nonce challenge)
+    note left: This is the "reactive" nonce.
+
+    C -> C: Create new DPoP proof for retry
+    note right: Uses the specific nonce from the 401 challenge. This bypasses the pool.
+
+    C -> RS: GET /resource\n(Authorization + new DPoP Proof)
+    note left: Request is retried with the challenge nonce.
+
+    RS -> RS: Re-validate proof (now with correct nonce)
+    note right: Validation succeeds.
+
+    RS -> C: 200 OK (Resource Data + DPoP-Nonce)
+    note left: Server provides a new nonce for the *next* request.
+
+    C -> C: Add new Nonce to Pool
+end
 
 @enduml

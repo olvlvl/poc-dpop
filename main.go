@@ -569,7 +569,6 @@ func generateAccessToken(jkt, subject string) (string, error) {
 			ExpiresAt: jwt.NewNumericDate(expirationTime),
 			IssuedAt:  jwt.NewNumericDate(now),
 			NotBefore: jwt.NewNumericDate(now),
-			Issuer:    "dpop-auth-server",
 			Subject:   subject,
 			Audience:  []string{"dpop-resource-server"},
 		},
@@ -633,11 +632,6 @@ func extractJktFromAccessToken(authHeader string) (string, error) {
 // Server validates the proof and issues both an access token and a fresh nonce.
 // The client must use this nonce for subsequent resource requests.
 func handleTokenRequest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	// Validate DPoP proof (nonce not required for initial token request)
 	jkt, err := validateDPoPProof(r, NonceValidateIfPresent)
 	if err != nil {
@@ -846,7 +840,8 @@ func main() {
 	logger.Info("Background cleanup routines started")
 
 	// Define endpoints
-	http.HandleFunc("/token", enableCORS(handleTokenRequest))
+	http.HandleFunc("POST /token", enableCORS(handleTokenRequest))
+	http.HandleFunc("OPTIONS /token", enableCORS(func(w http.ResponseWriter, r *http.Request) {}))
 	http.HandleFunc("/high-value-resource", enableCORS(dpopValidator(handleResourceRequest, NonceRequired)))
 	http.HandleFunc("/low-value-resource", enableCORS(dpopValidator(handleResourceRequest, NonceValidateIfPresent)))
 
